@@ -146,6 +146,35 @@ class MultiHeadAttention(nn.Module):
     return output, attn_weights
 
 
+# encoder layer
+class EncoderLayer(nn.Module):
+  def __init__(self, config):
+    super().__init__()
+    self.config = config
+
+    self.self_attn = MultiHeadAttention(self.config)
+    self.layer_norm1 = nn.LayerNorm(self.config["d_model"], eps = self.config["layer_norm_epsilon"])
+    self.ffn = FFN(self.config)
+    self.layer_norm2 = nn.LayerNorm(self.config["d_model"], eps = self.config["layer_norm_epsilon"])
+
+  '''
+  Args:
+      inputs: (batch_size, len_seq, d_model)
+      attn_mask: (batch_size, len_q, len_k)
+  '''
+  def forward(self, inputs, attn_mask):
+    # (batch_size, len_q, d_model), (batch_size, h, len_q, len_k)
+    attn_output, attn_weights = self.self_attn(inputs, inputs, inputs, attn_mask)
+    # (batch_size, len_q, d_model)
+    attn_output = self.layer_norm1(inputs + attn_output)
+    # (batch_size, len_q, d_model)
+    ffn_output = self.ffn(attn_output)
+    # (batch_size, len_q, d_model)
+    ffn_output = self.layer_norm2(ffn_output + attn_output)
+    # (batch_size, len_q, d_model), (batch_size, h, len_q, len_k)
+    return ffn_output, attn_weights
+
+
 # Encoder
 class Encoder(nn.Module):
   def __init__(self, config):
@@ -153,9 +182,112 @@ class Encoder(nn.Module):
     self.config = config
 
     self.enc_emb = nn.Embedding(self.config["n_enc_vocab"], self.config["d_model"])
-    pos_enc_table = torch.FloatTensor(get_sinusoidal(self.config["n_enc_seq"], self.config["d_model"]))
+    pos_enc_table = torch.FloatTensor(get_sinusoidal(self.config["n_enc_seq"] + 1, self.config["d_model"]))
     self.pos_emb = nn.Embedding.from_pretrained(pos_enc_table, freeze=True)
 
-    # to do: EncoderLayer
+    self.layers = nn.ModuleList([EncoderLayer(self.config) for _ in range(self.config["n_layer"])])
 
-  # to do: forward
+  '''
+  Args
+      inputs: (batch_size, len_seq)
+  '''
+  def forward(self, inputs):
+    # (batch_size, len_enc_seq)
+    positions = torch.arange(inputs.size(1), device=inputs.device, dtype=inputs.dtype).expand(inputs.size(0), inputs.size(1)).contiguous() + 1
+    pos_mask = inputs.eq(self.config["i_pad"])
+    positions.masked_fill_(pos_mask, 0)
+
+    # (batch_size, len_enc_seq, d_model)
+    output = self.enc_emb(inputs) + self.pos_emb(positions)
+
+    # (batch_size, len_enc_seq, len_enc_seq)
+    attn_mask = get_attn_pad_mask(inputs, inputs, self.config["i_pad"])
+
+    attn_weights_history = list([])
+    for layer in self.layers:
+      # (batch_size, len_enc_seq, d_model), (batch_size, h, len_enc_seq, len_enc_seq)
+      output, attn_weights = layer(output, attn_mask)
+      attn_weights_history.append(attn_weights)
+
+    # (batch_size, len_enc_seq, d_model), [(batch_size, h, len_enc_seq, len_enc_seq)]
+    return output, attn_weights_history
+  
+
+# decoder layer
+class DecoderLayer(nn.Module):
+  def __init__(self, config):
+    super().__init__()
+    self.config = config
+
+    self.self_attn = MultiHeadAttention(self.config)
+    self.layer_norm1 = nn.LayerNorm(self.config["d_model"], eps = self.config["layer_norm_epsilon"])
+    self.enc_dec_attn = MultiHeadAttention(self.config)
+    self.layer_norm2 = nn.LayerNorm(self.config["d_model"], eps = self.config["layer_norm_epsilon"])
+    self.ffn = FFN(self.config)
+    self.layer_norm3 = nn.LayerNorm(self.config["d_model"], eps = self.config["layer_norm_epsilon"])
+
+  '''
+  Args:
+      dec_inputs: (batch_size, len_seq, d_model)
+      enc_outputs: (batch_size, len_enc_seq, d_model)
+      self_attn_mask: (batch_size, len_dec_seq, len_dec_seq)
+      enc_dec_attn_mask: (batch_size, len_dec_seq, len_enc_seq)
+  '''
+  def forward(self, dec_inputs, enc_outputs, self_attn_mask, enc_dec_attn_mask):
+    # (batch_size, len_dec_seq, d_model), (batch_size, h, len_dec_seq, len_dec_seq)
+    self_attn_output, self_attn_weights = self.self_attn(dec_inputs, dec_inputs, dec_inputs, self_attn_mask)
+    self_attn_output = self.layer_norm1(dec_inputs + self_attn_output)
+    # (batch_size, len_dec_seq, d_model), (batch_size, h, len_dec_seq, len_ebc_seq)
+    enc_dec_attn_output, enc_dec_attn_weights = self.enc_dec_attn(self_attn_output, enc_outputs, enc_outputs, enc_dec_attn_mask)
+    enc_dec_attn_output = self.layer_norm2(self_attn_output + enc_dec_attn_output)
+    # (batch_size, len_dec_seq, d_model)
+    ffn_output = self.ffn(enc_dec_attn_output)
+    ffn_output = self.layer_norm3(enc_dec_attn_output + ffn_output)
+    # (batch_size, len_dec_seq, d_model), (batch_size, h, len_dec_seq, len_dec_seq), (batch_size, h, len_dec_seq, len_ebc_seq)
+    return ffn_output, self_attn_weights, enc_dec_attn_weights  
+  
+
+# Decoder 
+class Decoder(nn.Module):
+  def __init__(self, config):
+    super().__init__()
+    self.config = config
+
+    self.dec_emb = nn.Embedding(self.config["n_dec_vocab"], self.config["d_model"])
+    pos_enc_table = torch.FloatTensor(get_sinusoidal(self.config["n_dec_seq"] + 1, self.config["d_model"]))
+    self.pos_emb = nn.Embedding.from_pretrained(pos_enc_table, freeze=True)
+
+    self.layers = nn.ModuleList([DecoderLayer(self.config) for _ in range(self.config["n_layer"])])
+
+  '''
+  Args:
+      dec_inputs: (batch_size, len_dec_seq, d_model)
+      enc_inputs: (batch_size, len_enc_seq, d_model)
+      enc_outputs: (batch_size, len_enc_seq, d_model)
+  '''
+  def forward(self, dec_inputs, enc_inputs, enc_outputs):
+    # (batch_size, len_enc_seq)
+    positions = torch.arange(dec_inputs.size(1), device=dec_inputs.device, dtype=dec_inputs.dtype).expand(dec_inputs.size(0), dec_inputs.size(1)).contiguous() + 1
+    pos_mask = dec_inputs.eq(self.config["i_pad"])
+    positions.masked_fill_(pos_mask, 0)
+
+    # (batch_size, n_dec_seq, d_model)
+    dec_output = self.dec_emb(dec_inputs) + self.pos_emb(positions)
+
+    # (batch_size, len_dec_seq, len_dec_seq)
+    attn_pad_mask = get_attn_pad_mask(dec_inputs, dec_inputs, self.config["i_pad"])
+    # (batch_size, len_dec_seq, len_dec_seq)
+    attn_decoder_mask = get_attn_decoder_mask(dec_inputs)
+    # (batch_size, len_dec_seq, len_dec_seq)
+    self_attn_mask = torch.gt((attn_pad_mask + attn_decoder_mask), 0)
+    # (batch_size, len_dec_seq, len_enc_seq)
+    enc_dec_attn_mask = get_attn_pad_mask(dec_inputs, enc_inputs, self.config["i_pad"])
+
+    self_attn_weights_history, enc_dec_attn_weights_history = list([]), list([])
+    for layer in self.layers:
+      # (batch_size, len_dec_seq, d_model), (batch_size, h, len_dec_seq, len_dec_seq), (batch_size, h, len_dec_seq, len_ebc_seq)
+      output, self_attn_weights, enc_dec_attn_weights = layer(dec_output, enc_outputs, self_attn_mask, enc_dec_attn_mask)
+      self_attn_weights_history.append(self_attn_weights)
+      enc_dec_attn_weights_history.append(enc_dec_attn_weights)
+    # (batch_size, len_dec_seq, d_model), (batch_size, h, len_dec_seq, len_dec_seq), (batch_size, h, len_dec_seq, len_ebc_seq)
+    return output, self_attn_weights_history, enc_dec_attn_weights_history
